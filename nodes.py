@@ -1,30 +1,25 @@
-import sys
-import argparse
 import os
-import cv2
-from tqdm import tqdm
-import torch
-import torchvision
-import time
-import numpy as np
-from PIL import Image
-from pathlib import Path
-from omegaconf import OmegaConf
-from torch.utils.data import DataLoader
 from dataclasses import dataclass, field
 from typing import List, Tuple
-from einops import rearrange
-import folder_paths
-# import tensorflow_io as tfio
+
+import cv2
+import numpy as np
+import torch
+import torch.nn as nn
+import torchvision
+from PIL import Image
+from torch.utils.data import DataLoader
+from tqdm import tqdm
+import comfy.samplers
 
 from .Paint3D.paint3d import utils
-from .Paint3D.paint3d.models.textured_mesh import TexturedMeshModel
-from .Paint3D.paint3d.dataset import init_dataloaders
 from .Paint3D.paint3d.config.train_config_paint3d import GuideConfig, OptimConfig, LogConfig
+from .Paint3D.paint3d.models.textured_mesh import TexturedMeshModel
 
 
-def to_pil_image(hwc_tensor: torch.Tensor) -> Image.Image:
-    return Image.fromarray((hwc_tensor.cpu().numpy() * 255).astype(np.uint8))
+def to_pil_image(tensor: torch.Tensor) -> Image.Image:
+    tensor = bhwc_to_hwc(tensor)
+    return Image.fromarray((tensor.cpu().numpy() * 255).astype(np.uint8))
 
 
 def chw_to_bhwc(tensor: torch.Tensor) -> torch.Tensor:
@@ -74,14 +69,13 @@ def to_tensor_image(image: Image.Image) -> torch.Tensor:
 
 def get_output_directory(obj_path):
     dir = os.path.dirname(obj_path)
-    new_dir = os.path.join(dir, "output")
+    new_dir = os.path.join(dir, "Paint3D")
     if not os.path.exists(new_dir):
         os.makedirs(new_dir)
     return new_dir
 
 
-
-def inpaint_viewpoint(save_result_dir: str, mesh_model: TexturedMeshModel, dataloaders, inpaint_view_ids):
+def inpaint_viewpoint(output_dir: str, mesh_model: TexturedMeshModel, dataloaders, inpaint_view_ids):
     view_angle_info = {i: data for i, data in enumerate(dataloaders)}
     inpaint_used_key = ["image", "depth", "uncolored_mask"]
     results = {}
@@ -102,7 +96,7 @@ def inpaint_viewpoint(save_result_dir: str, mesh_model: TexturedMeshModel, datal
         name = inpaint_used_key[i]
         if name == "uncolored_mask":
             img[img > 0] = 1
-        save_path = os.path.join(save_result_dir, f"view_{t}_{name}.png")
+        save_path = os.path.join(output_dir, f"view_{t}_{name}.png")
         utils.save_tensor_image(img, save_path=save_path)
         results[name] = img
 
@@ -110,7 +104,7 @@ def inpaint_viewpoint(save_result_dir: str, mesh_model: TexturedMeshModel, datal
 
 
 @torch.no_grad()
-def generate_video(dataloaders, mesh_model, save_result_dir):
+def generate_video(dataloaders, mesh_model, output_dir, video_file_name="render_rgb.mp4"):
     all_render_rgb_frames = []
     mesh_model.renderer.clear_seen_faces()
     for i, data in tqdm(enumerate(dataloaders), desc="Evalating textured mesh~"):
@@ -124,10 +118,39 @@ def generate_video(dataloaders, mesh_model, save_result_dir):
         rgb_render = outputs['image'] * (1 - uncolored_masks) + color_with_shade_img * uncolored_masks
         all_render_rgb_frames.append(utils.tensor2numpy(rgb_render))
 
-    safe_path = os.path.join(save_result_dir, "render_rgb.mp4")
-    utils.save_video(np.stack(all_render_rgb_frames, axis=0), safe_path)
+    save_path = os.path.join(output_dir, f"{video_file_name}.mp4")
+    if os.path.exists(save_path):
+        os.remove(save_path)
 
-    return safe_path
+    utils.save_video(np.stack(all_render_rgb_frames, axis=0), save_path)
+
+    return save_path
+
+
+def extract_bg_mask(albedo: torch.Tensor, mask_color=[204, 25, 204], dilate_kernel=5):
+    np_albedo = (albedo.squeeze(0).cpu().numpy() * 255).astype(np.uint8)
+    mask = (np_albedo == mask_color).all(axis=2).astype(np.float32)
+    mask = mask[:, :, np.newaxis]
+
+    mask = cv2.dilate(mask, np.ones((dilate_kernel, dilate_kernel), np.uint8))[:, :, np.newaxis]
+    mask = (mask * 255).astype(np.uint8)
+    return mask
+
+
+def inpaint_uv(mesh_model: TexturedMeshModel, albedo: torch.Tensor, output_dir: str):
+    print(f"rendering texture and position map")
+    mesh_model.export_mesh(output_dir, export_texture_only=True)
+    UV_pos = mesh_model.UV_pos_render()
+    UV_pos_path = os.path.join(output_dir, f"UV_pos.png")
+    utils.save_tensor_image(UV_pos.permute(0, 3, 1, 2), UV_pos_path)
+
+    mask_dilated = extract_bg_mask(albedo, dilate_kernel=15)
+    mask_path = os.path.join(output_dir, f"mask.png")
+    cv2.imwrite(mask_path, mask_dilated)
+
+    mask = to_tensor_image(mask_dilated)
+
+    return mask, UV_pos
 
 
 @dataclass
@@ -135,7 +158,7 @@ class RenderConfig:
     """ Parameters for the Mesh Renderer """
     grid_size: int = 512
     radius: float = 1.5
-    look_at_height = 0.25
+    look_at_height = 0.5
     base_theta: float = 60
     # Suzanne
     fov_para: float = 0.8  # 0.61 or 0.8 for Orthographic ; np.pi / 3 for Pinhole
@@ -166,6 +189,32 @@ class TrainConfig:
     render: RenderConfig = field(default_factory=RenderConfig)
     optim: OptimConfig = field(default_factory=OptimConfig)
     guide: GuideConfig = field(default_factory=GuideConfig)
+    mesh_file_path = None
+    ckpt = None
+    clip = None
+    vae = None
+    sampler = None
+    scheduler = None
+    positive = None
+    negative = None
+    seed = -1
+    txt2img_steps = 20
+    txt2img_cfg = 8.0
+    txt2img_denoise = 1.0
+    inpaint_steps = 20
+    inpaint_cfg = 3.0
+    inpaint_denoise = 1.0
+    depth_strength = 1.0
+    depth_controlnet = None
+    inpaint_strength = 0.5
+    inpaint_controlnet = None
+    cam_front = 0
+    cam_back = 23
+    cam_left = 5
+    cam_right = 6
+    cam_top = 24
+    cam_bottom = 25
+    grid_size = 512
 
 
 class MultiviewDataset:
@@ -221,13 +270,109 @@ class GenerateTrainConfig:
         return {
             "required": {
                 "mesh_file_path": ("STRING", {"default": '', "multiline": False}),
+                "ckpt": ("MODEL",),
+                "clip": ("CLIP",),
+                "vae": ("VAE",),
+                "sampler": (comfy.samplers.KSampler.SAMPLERS,),
+                "scheduler": (comfy.samplers.KSampler.SCHEDULERS,),
+                "positive": ("CONDITIONING",),
+                "negative": ("CONDITIONING",),
+
+                "seed": ("INT", {"default": -1}),
+                "txt2img_steps": ("INT", {"default": 20, "min": 1, "max": 10000}),
+                "txt2img_cfg": ("FLOAT", {"default": 8.0, "min": 0.0, "max": 100.0, "step": 0.1, "round": 0.01}),
+                "txt2img_denoise": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "inpaint_steps": ("INT", {"default": 20, "min": 1, "max": 10000}),
+                "inpaint_cfg": ("FLOAT", {"default": 3.0, "min": 0.0, "max": 100.0, "step": 0.1, "round": 0.01}),
+                "inpaint_denoise": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
+
+                "depth_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10.0, "step": 0.01}),
+                "depth_controlnet": ("CONTROL_NET",),
+
+                "inpaint_strength": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 10.0, "step": 0.01}),
+                "inpaint_controlnet": ("CONTROL_NET",),
+
+                "projection_mode": (["Orthographic", "Pinhole"],),
+                "look_at_height": ("FLOAT", {"default": 0.25, "step": 0.01}),
+
+                "cam_front": ("INT", {"default": 0, "min": 0, "max": 25}),
+                "cam_back": ("INT", {"default": 23, "min": 0, "max": 25}),
+                "cam_left": ("INT", {"default": 5, "min": 0, "max": 25}),
+                "cam_right": ("INT", {"default": 6, "min": 0, "max": 25}),
+                "cam_top": ("INT", {"default": 24, "min": 0, "max": 25}),
+                "cam_bottom": ("INT", {"default": 25, "min": 0, "max": 25}),
+                "grid_size": ("INT", {"default": 512}),
             }
         }
 
-    def generate(self, mesh_file_path):
+    def generate(self, mesh_file_path, ckpt, clip, vae, sampler, scheduler, positive, negative, seed, txt2img_steps, txt2img_cfg,
+                 txt2img_denoise, inpaint_steps, inpaint_cfg, inpaint_denoise, depth_strength, depth_controlnet,
+                 inpaint_strength, inpaint_controlnet, projection_mode, look_at_height, cam_front, cam_back, cam_left, cam_right,
+                 cam_top, cam_bottom, grid_size):
         config = TrainConfig()
         config.guide.shape_path = mesh_file_path
+        config.ckpt = ckpt
+        config.clip = clip
+        config.vae = vae
+        config.sampler = sampler
+        config.scheduler = scheduler
+        config.positive = positive
+        config.negative = negative
+        config.seed = seed
+        config.txt2img_steps = txt2img_steps
+        config.txt2img_cfg = txt2img_cfg
+        config.txt2img_denoise = txt2img_denoise
+        config.inpaint_steps = inpaint_steps
+        config.inpaint_cfg = inpaint_cfg
+        config.inpaint_denoise = inpaint_denoise
+        config.depth_strength = depth_strength
+        config.depth_controlnet = depth_controlnet
+        config.inpaint_strength = inpaint_strength
+        config.inpaint_controlnet = inpaint_controlnet
+
+        config.render.projection_mode = projection_mode
+        if projection_mode == "Orthographic":
+            config.render.fov_para = 0.8
+        else:
+            config.render.fov_para = np.pi / 3 * 0.9
+        config.render.look_at_height = look_at_height
+
+        config.cam_front = cam_front
+        config.cam_back = cam_back
+        config.cam_left = cam_left
+        config.cam_right = cam_right
+        config.cam_top = cam_top
+        config.render.grid_size = grid_size
         return (config,)
+
+
+class TrainConfigPipe:
+    RETURN_TYPES = (
+    "TRAINCONFIG", "MODEL", "CLIP", "VAE", comfy.samplers.KSampler.SAMPLERS, comfy.samplers.KSampler.SCHEDULERS, "CONDITIONING",
+    "CONDITIONING", "INT", "INT", "FLOAT", "FLOAT", "INT", "FLOAT", "FLOAT", "FLOAT", "CONTROL_NET", "FLOAT", "CONTROL_NET",
+    "INT", "INT", "INT", "INT", "INT", "INT", "LATENT")
+    RETURN_NAMES = (
+    "train_config", "ckpt", "clip", "vae", "sampler_name", "scheduler", "positive", "negative", "seed", "txt2img_steps", "txt2img_cfg",
+    "txt2img_denoise", "inpaint_steps", "inpaint_cfg", "inpaint_denoise", "depth_strength", "depth_controlnet",
+    "inpaint_strength", "inpaint_controlnet", "cam_front", "cam_back", "cam_left", "cam_right", "cam_top", "cam_bottom", "latent")
+    FUNCTION = "pipe"
+    CATEGORY = "Paint3D"
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "train_config": ("TRAINCONFIG",),
+            }
+        }
+
+    def pipe(self, train_config: TrainConfig):
+        batch_size = 1
+        width = train_config.render.grid_size * 2
+        height = train_config.render.grid_size
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        latent = {"samples": torch.zeros([batch_size, 4, height // 8, width // 8], device=device)}
+        return train_config, train_config.ckpt, train_config.clip, train_config.vae, train_config.sampler, train_config.scheduler, train_config.positive, train_config.negative, train_config.seed, train_config.txt2img_steps, train_config.txt2img_cfg, train_config.txt2img_denoise, train_config.inpaint_steps, train_config.inpaint_cfg, train_config.inpaint_denoise, train_config.depth_strength, train_config.depth_controlnet, train_config.inpaint_strength, train_config.inpaint_controlnet, train_config.cam_front, train_config.cam_back, train_config.cam_left, train_config.cam_right, train_config.cam_top, train_config.cam_bottom, latent
 
 
 class GenerateTextureMeshModel:
@@ -251,7 +396,7 @@ class GenerateTextureMeshModel:
         return (mesh_model,)
 
 
-class GenerateDilateDepthImage:
+class GenerateDepthImage:
     RETURN_TYPES = ("IMAGE",)
     FUNCTION = "generate"
     CATEGORY = "Paint3D"
@@ -301,15 +446,11 @@ class GenerateDilateDepthImage:
 
         init_depth_map = torch.cat(init_depth_map, dim=0).repeat(1, 3, 1, 1)
         init_depth_map = torchvision.utils.make_grid(init_depth_map, nrow=2, padding=0)  # CHW
-        init_depth_map = chw_to_hwc(init_depth_map)
-        depth_pil_img = to_pil_image(hwc_tensor=init_depth_map)
+        init_depth_map = chw_to_bhwc(init_depth_map)
+        depth_pil_img = to_pil_image(tensor=init_depth_map)
 
         depth_dilated = self.dilate_depth_outline(depth_pil_img, iters=5, dilate_kernel=3)
         tensor_depth_dilated = to_tensor_image(depth_dilated)
-
-        # init_rgb_map = torch.cat(init_rgb_map, dim=0).repeat(1, 1, 1, 1)
-        # init_rgb_map = torchvision.utils.make_grid(init_rgb_map, nrow=2, padding=0)
-        # rgb_map = init_rgb_map.unsqueeze(0).permute(0, 2, 3, 1)  # [c, h, w]-->[n, h, w, c]
 
         return (tensor_depth_dilated,)
 
@@ -331,7 +472,7 @@ class ProjectToMeshModel:
             }
         }
 
-    def forward_texturing(self, cfg, dataloaders, mesh_model, save_result_dir, device, view_imgs=[], view_ids=[],
+    def forward_texturing(self, cfg, dataloaders, mesh_model, output_dir, device, view_imgs=[], view_ids=[],
                           verbose=False):
         assert len(view_imgs) == len(view_ids), "the number of view_imgs should equal to the number of view_ids"
 
@@ -356,19 +497,21 @@ class ProjectToMeshModel:
                 phi=phi,
                 radius=radius,
                 view_target=target_sd,
-                save_result_dir=save_result_dir,
+                save_result_dir=output_dir,
                 view_id=view_id,
                 verbose=verbose)
 
-        return mesh_model.export_mesh(save_result_dir)
+        obj_filename = os.path.splitext(os.path.basename(cfg.guide.shape_path))[0]
+        albedo = mesh_model.export_mesh(output_dir, obj_filename)
+
+        return albedo
 
     def project(self, image: torch.Tensor, mesh_model: TexturedMeshModel, cam1=0, cam2=23):
         train_config: TrainComfig = mesh_model.cfg
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         dataset = MultiviewDataset(train_config, device)
         dataloaders = dataset.dataloader()
-        hwc_image = bhwc_to_hwc(image)
-        pil_image = to_pil_image(hwc_tensor=hwc_image)
+        pil_image = to_pil_image(tensor=image)
         view_imgs = utils.split_grid_image(img=np.array(pil_image), size=(1, 2))
         output_dir = get_output_directory(train_config.guide.shape_path)
 
@@ -376,7 +519,7 @@ class ProjectToMeshModel:
             cfg=train_config,
             dataloaders=dataloaders,
             mesh_model=mesh_model,
-            save_result_dir=output_dir,
+            output_dir=output_dir,
             device=device,
             view_imgs=view_imgs,
             view_ids=[cam1, cam2],
@@ -385,7 +528,7 @@ class ProjectToMeshModel:
         return mesh_model, albedo,
 
 
-class GenerateInpaintImageAndMask:
+class GenerateInpaintMask:
     RETURN_TYPES = ("IMAGE", "MASK", "IMAGE",)
     RETURN_NAMES = ("image", "mask", "depth")
     FUNCTION = "generate"
@@ -408,7 +551,7 @@ class GenerateInpaintImageAndMask:
         dataloaders = dataset.dataloader()
         output_dir = get_output_directory(train_config.guide.shape_path)
         image, depth, mask = inpaint_viewpoint(
-            save_result_dir=output_dir, mesh_model=mesh_model, dataloaders=dataloaders, inpaint_view_ids=[cam1, cam2], )
+            output_dir=output_dir, mesh_model=mesh_model, dataloaders=dataloaders, inpaint_view_ids=[cam1, cam2], )
 
         image = chw_to_bhwc(image)
         mask = chw_to_bhwc(mask)
@@ -429,25 +572,85 @@ class GeneratePreviewVideo:
         return {
             "required": {
                 "mesh_model": ("MESHMODEL",),
+                "file_name": ("STRING", {"default": "render.mp4"}),
             }
         }
 
-    def generate(self, mesh_model: TexturedMeshModel):
+    def generate(self, mesh_model: TexturedMeshModel, file_name):
         train_config: TrainComfig = mesh_model.cfg
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        output_dir = get_output_directory(train_config.guide.shape_path)
         dataset = MultiviewDataset(train_config, device)
         dataloaders = dataset.dataloader()
-        output_dir = get_output_directory(train_config.guide.shape_path)
+        albedo_path = os.path.join(output_dir, "albedo.png")
+        if os.path.exists(albedo_path):
+            mesh_model.initial_texture_path = albedo_path
+            mesh_model.refresh_texture()
+
         video_url = generate_video(
-            dataloaders=dataloaders, mesh_model=mesh_model, save_result_dir=output_dir, )
-        return (video_url, )
+            dataloaders=dataloaders, mesh_model=mesh_model, output_dir=output_dir, video_file_name=file_name)
+        return (video_url,)
+
+
+class GenerateInpaintUVMapMask:
+    RETURN_TYPES = ("MASK", "IMAGE",)
+    RETURN_NAMES = ("mask", "uv_map",)
+    FUNCTION = "generate"
+    CATEGORY = "Paint3D"
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "mesh_model": ("MESHMODEL",), "albedo": ("IMAGE",),
+            }
+        }
+
+    def generate(self, mesh_model: TexturedMeshModel, albedo: torch.Tensor):
+        train_config: TrainComfig = mesh_model.cfg
+        output_dir = get_output_directory(train_config.guide.shape_path)
+        mask, uv = inpaint_uv(mesh_model=mesh_model, albedo=albedo, output_dir=output_dir)
+        mask = mask[:, :, :, 0]
+        return mask, uv
+
+
+class SaveUVMapImage:
+    RETURN_TYPES = ("MESHMODEL", )
+    FUNCTION = "save"
+    CATEGORY = "Paint3D"
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "mesh_model": ("MESHMODEL",), "uv_map": ("IMAGE",),
+            }
+        }
+
+    def save(self, mesh_model: TexturedMeshModel, uv_map: torch.Tensor):
+        train_config: TrainComfig = mesh_model.cfg
+        albedo_path = os.path.join(f"{get_output_directory(train_config.guide.shape_path)}", "albedo.png")
+        before_albedo_path = os.path.join(f"{get_output_directory(train_config.guide.shape_path)}", "before_albedo.png")
+
+        if os.path.exists(before_albedo_path):
+            os.remove(before_albedo_path)
+        if os.path.exists(albedo_path):
+            os.rename(albedo_path, f"{before_albedo_path}")
+
+        img = Image.fromarray(np.clip(255. * bhwc_to_hwc(uv_map).cpu().numpy(), 0, 255).astype(np.uint8))
+        img.save(albedo_path)
+
+        return (mesh_model, )
 
 
 NODE_CLASS_MAPPINGS = {
-    "3D_GenerateDepthImage": GenerateDilateDepthImage,
+    "3D_GenerateDepthImage": GenerateDepthImage,
     "3D_TrainConfig": GenerateTrainConfig,
     "3D_LoadMeshModel": GenerateTextureMeshModel,
     "3D_Projection": ProjectToMeshModel,
-    "3D_GenerateInpaintImageAndMask": GenerateInpaintImageAndMask,
+    "3D_GenerateInpaintMask": GenerateInpaintMask,
     "3D_GeneratePreviewVideo": GeneratePreviewVideo,
+    "3D_GenerateInpaintUVMapMask": GenerateInpaintUVMapMask,
+    "3D_SaveUVMapImage": SaveUVMapImage,
+    "3D_TrainConfigPipe": TrainConfigPipe,
 }
