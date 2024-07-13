@@ -1,0 +1,15 @@
+[project]
+name = "comfyui-paint3d-nodes"
+description = "Paint3D Nodes is a custom ComfyUI node for 3D model texture inpainting based on [a/Paint3D](https://arxiv.org/pdf/2312.13913)."
+version = "1.0.0"
+license = "LICENSE"
+dependencies = ["albumentations", "opencv-python", "imageio", "imageio-ffmpeg", "pytorch-lightning", "omegaconf", "test-tube>=0.7.5", "streamlit", "einops", "transformers", "webdataset", "kornia", "open_clip_torch", "invisible-watermark>=0.1.5", "streamlit-drawable-canvas", "torchmetrics", "diffusers", "accelerate", "loguru", "trimesh", "xatlas"]
+
+[project.urls]
+Repository = "https://github.com/N3rd00d/ComfyUI-Paint3D-Nodes"
+#  Used by Comfy Registry https://comfyregistry.org
+
+[tool.comfy]
+PublisherId = ""
+DisplayName = "ComfyUI-Paint3D-Nodes"
+Icon = ""
