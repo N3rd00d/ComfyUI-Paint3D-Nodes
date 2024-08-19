@@ -13,7 +13,7 @@ from tqdm import tqdm
 import comfy.samplers
 
 from .Paint3D.paint3d import utils
-from .Paint3D.paint3d.config.train_config_paint3d import GuideConfig, OptimConfig, LogConfig
+from .Paint3D.paint3d.config.train_config_paint3d import GuideConfig, OptimConfig, LogConfig, TrainConfig
 from .Paint3D.paint3d.models.textured_mesh import TexturedMeshModel
 
 
